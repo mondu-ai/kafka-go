@@ -484,6 +484,14 @@ func (g *Generation) heartbeatLoop(interval time.Duration) {
 					MemberID:     g.MemberID,
 				})
 				if err != nil {
+					// RebalanceInProgress is how a member learns of a rebalance, not a failure.
+					logf := g.logError
+					if errors.Is(err, RebalanceInProgress) {
+						logf = g.log
+					}
+					logf(func(l Logger) {
+						l.Printf("heartbeat for group %s ended generation %d: %v", g.GroupID, g.ID, err)
+					})
 					return
 				}
 			}

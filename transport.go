@@ -95,7 +95,9 @@ type Transport struct {
 	// If the Server
 	TLS *tls.Config
 
-	// SASL configures the Transfer to use SASL authentication.
+	// SASL configures the Transfer to use SASL authentication.  Connections
+	// re-authenticate before the session lifetime announced by the broker
+	// elapses (KIP-368).
 	SASL sasl.Mechanism
 
 	// An optional resolver used to translate broker host names into network
@@ -1211,26 +1213,32 @@ func (g *connGroup) connect(ctx context.Context, addr net.Addr) (*conn, error) {
 	pc.SetVersions(ver)
 	pc.SetDeadline(time.Time{})
 
+	var saslMetadata *sasl.Metadata
+	var saslReauthAtNanos int64
 	if g.pool.sasl != nil {
 		host, port, err := splitHostPortNumber(netAddr.String())
 		if err != nil {
 			return nil, err
 		}
-		metadata := &sasl.Metadata{
+		saslMetadata = &sasl.Metadata{
 			Host: host,
 			Port: port,
 		}
-		if err := authenticateSASL(sasl.WithMetadata(ctx, metadata), pc, g.pool.sasl); err != nil {
+		lifetime, err := authenticateSASL(sasl.WithMetadata(ctx, saslMetadata), pc, g.pool.sasl)
+		if err != nil {
 			return nil, err
 		}
+		saslReauthAtNanos = nextSASLReauth(lifetime)
 	}
 
 	reqs := make(chan connRequest)
 	c := &conn{
-		network: netAddr.Network(),
-		address: netAddr.String(),
-		reqs:    reqs,
-		group:   g,
+		network:      netAddr.Network(),
+		address:      netAddr.String(),
+		reqs:         reqs,
+		group:        g,
+		saslMetadata: saslMetadata,
+		saslReauthAt: saslReauthAtNanos,
 	}
 	go c.run(pc, reqs)
 
@@ -1245,6 +1253,10 @@ type conn struct {
 	once    sync.Once
 	group   *connGroup
 	timer   *time.Timer
+
+	// SASL re-authentication (KIP-368), owned by the run goroutine.
+	saslMetadata *sasl.Metadata
+	saslReauthAt int64
 }
 
 func (c *conn) close() {
@@ -1255,6 +1267,13 @@ func (c *conn) run(pc *protocol.Conn, reqs <-chan connRequest) {
 	defer pc.Close()
 
 	for cr := range reqs {
+		if saslReauthDue(c.saslReauthAt) {
+			if err := c.reauthenticate(pc); err != nil {
+				cr.res.reject(fmt.Errorf("SASL re-authentication failed: %w", err))
+				break
+			}
+		}
+
 		r, err := c.roundTrip(cr.ctx, pc, cr.req)
 		if err != nil {
 			cr.res.reject(err)
@@ -1282,39 +1301,61 @@ func (c *conn) roundTrip(ctx context.Context, pc *protocol.Conn, req Request) (R
 	return pc.RoundTrip(req)
 }
 
-// authenticateSASL performs all of the required requests to authenticate this
-// connection.  If any step fails, this function returns with an error.  A nil
-// error indicates successful authentication.
-func authenticateSASL(ctx context.Context, pc *protocol.Conn, mechanism sasl.Mechanism) error {
-	if err := saslHandshakeRoundTrip(pc, mechanism.Name()); err != nil {
-		return err
-	}
+// reauthenticate re-runs the SASL exchange on the live connection (KIP-368).
+func (c *conn) reauthenticate(pc *protocol.Conn) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.group.pool.dialTimeout)
+	defer cancel()
 
-	sess, state, err := mechanism.Start(ctx)
+	pc.SetDeadline(time.Now().Add(c.group.pool.dialTimeout))
+	defer pc.SetDeadline(time.Time{})
+
+	lifetime, err := authenticateSASL(sasl.WithMetadata(ctx, c.saslMetadata), pc, c.group.pool.sasl)
 	if err != nil {
 		return err
 	}
 
+	c.saslReauthAt = nextSASLReauth(lifetime)
+	return nil
+}
+
+// authenticateSASL performs all of the required requests to authenticate this
+// connection.  If any step fails, this function returns with an error.  A nil
+// error indicates successful authentication.
+//
+// The returned session lifetime is non-zero only when the broker bounds the
+// session (SaslAuthenticate v1, KIP-368).
+func authenticateSASL(ctx context.Context, pc *protocol.Conn, mechanism sasl.Mechanism) (time.Duration, error) {
+	if err := saslHandshakeRoundTrip(pc, mechanism.Name()); err != nil {
+		return 0, err
+	}
+
+	sess, state, err := mechanism.Start(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	var lifetime time.Duration
 	for completed := false; !completed; {
-		challenge, err := saslAuthenticateRoundTrip(pc, state)
+		var challenge []byte
+		challenge, lifetime, err = saslAuthenticateRoundTrip(pc, state)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				// the broker may communicate a failed exchange by closing the
 				// connection (esp. in the case where we're passing opaque sasl
 				// data over the wire since there's no protocol info).
-				return SASLAuthenticationFailed
+				return 0, SASLAuthenticationFailed
 			}
 
-			return err
+			return 0, err
 		}
 
 		completed, state, err = sess.Next(ctx, challenge)
 		if err != nil {
-			return err
+			return 0, err
 		}
 	}
 
-	return nil
+	return lifetime, nil
 }
 
 // saslHandshake sends the SASL handshake message.  This will determine whether
@@ -1346,18 +1387,18 @@ func saslHandshakeRoundTrip(pc *protocol.Conn, mechanism string) error {
 // be immediately preceded by a successful saslHandshake.
 //
 // See http://kafka.apache.org/protocol.html#The_Messages_SaslAuthenticate
-func saslAuthenticateRoundTrip(pc *protocol.Conn, data []byte) ([]byte, error) {
+func saslAuthenticateRoundTrip(pc *protocol.Conn, data []byte) ([]byte, time.Duration, error) {
 	msg, err := pc.RoundTrip(&saslauthenticate.Request{
 		AuthBytes: data,
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	res := msg.(*saslauthenticate.Response)
 	if res.ErrorCode != 0 {
 		err = makeError(res.ErrorCode, res.ErrorMessage)
 	}
-	return res.AuthBytes, err
+	return res.AuthBytes, time.Duration(res.SessionLifetimeMs) * time.Millisecond, err
 }
 
 var _ RoundTripper = (*Transport)(nil)

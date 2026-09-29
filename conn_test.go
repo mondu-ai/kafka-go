@@ -1165,7 +1165,7 @@ func TestUnsupportedSASLMechanism(t *testing.T) {
 	}
 	defer conn.Close()
 
-	if err := conn.saslHandshake("FOO"); !errors.Is(err, UnsupportedSASLMechanism) {
+	if err := conn.saslHandshake(&conn.wdeadline, "FOO"); !errors.Is(err, UnsupportedSASLMechanism) {
 		t.Errorf("Expected UnsupportedSASLMechanism but got %v", err)
 	}
 }

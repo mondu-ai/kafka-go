@@ -52,3 +52,27 @@ func (t *saslAuthenticateResponseV0) readFrom(r *bufio.Reader, sz int) (remain i
 	}
 	return
 }
+
+// saslAuthenticateResponseV1 adds the session lifetime introduced by KIP-368.
+// A zero SessionLifetimeMs means the broker does not bound the session.
+type saslAuthenticateResponseV1 struct {
+	saslAuthenticateResponseV0
+
+	SessionLifetimeMs int64
+}
+
+func (t saslAuthenticateResponseV1) size() int32 {
+	return t.saslAuthenticateResponseV0.size() + sizeofInt64(t.SessionLifetimeMs)
+}
+
+func (t saslAuthenticateResponseV1) writeTo(wb *writeBuffer) {
+	t.saslAuthenticateResponseV0.writeTo(wb)
+	wb.writeInt64(t.SessionLifetimeMs)
+}
+
+func (t *saslAuthenticateResponseV1) readFrom(r *bufio.Reader, sz int) (remain int, err error) {
+	if remain, err = t.saslAuthenticateResponseV0.readFrom(r, sz); err != nil {
+		return
+	}
+	return readInt64(r, remain, &t.SessionLifetimeMs)
+}

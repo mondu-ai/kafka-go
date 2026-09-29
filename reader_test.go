@@ -1648,7 +1648,12 @@ func getOffsets(t *testing.T, config ReaderConfig) map[int]int64 {
 			ID:      config.GroupID,
 			Brokers: config.Brokers,
 			Dialer:  config.Dialer,
+			Topics:  []string{config.Topic},
 		},
+	}
+	// Validate installs the dial function and the timeouts coordinator() relies on.
+	if err := cg.config.Validate(); err != nil {
+		t.Fatalf("invalid consumer group config: %v", err)
 	}
 
 	conn, err := cg.coordinator()
