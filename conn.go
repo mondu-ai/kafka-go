@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/segmentio/kafka-go/sasl"
 )
 
 var (
@@ -65,6 +68,17 @@ type Conn struct {
 	apiVersions atomic.Value // apiVersionMap
 
 	transactionalID *string
+
+	// SASL re-authentication (KIP-368). sasl is immutable after dial; saslReauthAt
+	// is the unix-nano time of the next re-authentication, 0 when the session is unbounded.
+	sasl         *connSASL
+	saslReauthAt atomic.Int64
+	saslGate     sync.RWMutex
+}
+
+type connSASL struct {
+	mechanism sasl.Mechanism
+	metadata  *sasl.Metadata
 }
 
 type apiVersionMap map[apiKey]ApiVersion
@@ -784,6 +798,15 @@ func (c *Conn) ReadBatchWith(cfg ReadBatchConfig) *Batch {
 		return &Batch{err: dontExpectEOF(err)}
 	}
 
+	if err := c.reauthenticateIfDue(); err != nil {
+		return &Batch{err: dontExpectEOF(err)}
+	}
+
+	// The gate is held only until the response header is matched; the batch body
+	// is read under rlock, which a re-authentication waits for in waitResponse.
+	c.saslGate.RLock()
+	defer c.saslGate.RUnlock()
+
 	id, err := c.doRequest(&c.rdeadline, func(deadline time.Time, id int32) error {
 		now := time.Now()
 		var timeout time.Duration
@@ -1327,11 +1350,11 @@ func (c *Conn) writeDeadline() time.Time {
 }
 
 func (c *Conn) readOperation(write func(time.Time, int32) error, read func(time.Time, int) error) error {
-	return c.do(&c.rdeadline, write, read)
+	return c.guarded(&c.rdeadline, write, read)
 }
 
 func (c *Conn) writeOperation(write func(time.Time, int32) error, read func(time.Time, int) error) error {
-	return c.do(&c.wdeadline, write, read)
+	return c.guarded(&c.wdeadline, write, read)
 }
 
 func (c *Conn) enter() {
@@ -1344,6 +1367,87 @@ func (c *Conn) leave() {
 
 func (c *Conn) concurrency() int {
 	return int(atomic.LoadInt32(&c.inflight))
+}
+
+// guarded runs a request while holding the SASL gate for reading, so that a
+// pending re-authentication runs with no request in flight on the connection.
+func (c *Conn) guarded(d *connDeadline, write func(time.Time, int32) error, read func(time.Time, int) error) error {
+	if err := c.reauthenticateIfDue(); err != nil {
+		return err
+	}
+
+	c.saslGate.RLock()
+	defer c.saslGate.RUnlock()
+	return c.do(d, write, read)
+}
+
+// reauthenticateIfDue re-runs the SASL exchange on the live connection once the
+// broker-announced session lifetime is about to elapse (KIP-368).
+func (c *Conn) reauthenticateIfDue() error {
+	if !saslReauthDue(c.saslReauthAt.Load()) {
+		return nil
+	}
+
+	c.saslGate.Lock()
+	defer c.saslGate.Unlock()
+
+	// Another goroutine may have re-authenticated while we waited for the gate.
+	if !saslReauthDue(c.saslReauthAt.Load()) {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), saslReauthTimeout)
+	defer cancel()
+
+	var d connDeadline
+	d.setDeadline(time.Now().Add(saslReauthTimeout))
+
+	if err := c.authenticateSASL(sasl.WithMetadata(ctx, c.sasl.metadata), &d, c.sasl.mechanism); err != nil {
+		c.saslReauthAt.Store(0)
+		c.conn.Close()
+		// Not %w: a Kafka error in the chain makes the reader hand it to the
+		// application instead of reconnecting the connection just closed.
+		return fmt.Errorf("SASL re-authentication failed: %v", err)
+	}
+
+	return nil
+}
+
+// authenticateSASL runs the SASL exchange and schedules re-authentication when
+// the broker bounds the session. No other request may be in flight.
+func (c *Conn) authenticateSASL(ctx context.Context, d *connDeadline, mechanism sasl.Mechanism) error {
+	if err := c.saslHandshake(d, mechanism.Name()); err != nil {
+		return fmt.Errorf("SASL handshake failed: %w", err)
+	}
+
+	sess, state, err := mechanism.Start(ctx)
+	if err != nil {
+		return fmt.Errorf("SASL authentication process could not be started: %w", err)
+	}
+
+	var lifetime time.Duration
+	for completed := false; !completed; {
+		var challenge []byte
+		challenge, lifetime, err = c.saslAuthenticate(d, state)
+		switch {
+		case err == nil:
+		case errors.Is(err, io.EOF):
+			// the broker may communicate a failed exchange by closing the
+			// connection (esp. in the case where we're passing opaque sasl
+			// data over the wire since there's no protocol info).
+			return SASLAuthenticationFailed
+		default:
+			return err
+		}
+
+		completed, state, err = sess.Next(ctx, challenge)
+		if err != nil {
+			return fmt.Errorf("SASL authentication process has failed: %w", err)
+		}
+	}
+
+	c.saslReauthAt.Store(nextSASLReauth(lifetime))
+	return nil
 }
 
 func (c *Conn) do(d *connDeadline, write func(time.Time, int32) error, read func(time.Time, int) error) error {
@@ -1573,7 +1677,7 @@ func (d *connDeadline) unsetConnWriteDeadline() {
 // therefore the client should already know which mechanisms are supported.
 //
 // See http://kafka.apache.org/protocol.html#The_Messages_SaslHandshake
-func (c *Conn) saslHandshake(mechanism string) error {
+func (c *Conn) saslHandshake(d *connDeadline, mechanism string) error {
 	// The wire format for V0 and V1 is identical, but the version
 	// number will affect how the SASL authentication
 	// challenge/responses are sent
@@ -1584,7 +1688,8 @@ func (c *Conn) saslHandshake(mechanism string) error {
 		return err
 	}
 
-	err = c.writeOperation(
+	// Bypass the SASL gate: this runs while re-authentication holds it.
+	err = c.do(d,
 		func(deadline time.Time, id int32) error {
 			return c.writeRequest(saslHandshake, version, id, &saslHandshakeRequestV0{Mechanism: mechanism})
 		},
@@ -1603,25 +1708,37 @@ func (c *Conn) saslHandshake(mechanism string) error {
 // saslAuthenticate sends the SASL authenticate message.  This function must
 // be immediately preceded by a successful saslHandshake.
 //
+// The returned session lifetime is non-zero only when the broker bounds the
+// session (SaslAuthenticate v1, KIP-368).
+//
 // See http://kafka.apache.org/protocol.html#The_Messages_SaslAuthenticate
-func (c *Conn) saslAuthenticate(data []byte) ([]byte, error) {
+func (c *Conn) saslAuthenticate(d *connDeadline, data []byte) ([]byte, time.Duration, error) {
 	// if we sent a v1 handshake, then we must encapsulate the authentication
 	// request in a saslAuthenticateRequest.  otherwise, we read and write raw
 	// bytes.
 	version, err := c.negotiateVersion(saslHandshake, v0, v1)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if version == v1 {
-		var request = saslAuthenticateRequestV0{Data: data}
-		var response saslAuthenticateResponseV0
+		authVersion, err := c.negotiateVersion(saslAuthenticate, v0, v1)
+		if err != nil {
+			return nil, 0, err
+		}
 
-		err := c.writeOperation(
+		var request = saslAuthenticateRequestV0{Data: data}
+		var response saslAuthenticateResponseV1
+
+		// Bypass the SASL gate: this runs while re-authentication holds it.
+		err = c.do(d,
 			func(deadline time.Time, id int32) error {
-				return c.writeRequest(saslAuthenticate, v0, id, request)
+				return c.writeRequest(saslAuthenticate, authVersion, id, request)
 			},
 			func(deadline time.Time, size int) error {
 				return expectZeroSize(func() (remain int, err error) {
+					if authVersion == v0 {
+						return (&response.saslAuthenticateResponseV0).readFrom(&c.rbuf, size)
+					}
 					return (&response).readFrom(&c.rbuf, size)
 				}())
 			},
@@ -1629,24 +1746,24 @@ func (c *Conn) saslAuthenticate(data []byte) ([]byte, error) {
 		if err == nil && response.ErrorCode != 0 {
 			err = Error(response.ErrorCode)
 		}
-		return response.Data, err
+		return response.Data, time.Duration(response.SessionLifetimeMs) * time.Millisecond, err
 	}
 
 	// fall back to opaque bytes on the wire.  the broker is expecting these if
 	// it just processed a v0 sasl handshake.
 	c.wb.writeInt32(int32(len(data)))
 	if _, err := c.wb.Write(data); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := c.wb.Flush(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var respLen int32
 	if _, err := readInt32(&c.rbuf, 4, &respLen); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	resp, _, err := readNewBytes(&c.rbuf, int(respLen), int(respLen))
-	return resp, err
+	return resp, 0, err
 }

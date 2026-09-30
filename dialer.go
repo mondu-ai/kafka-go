@@ -3,9 +3,7 @@ package kafka
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -81,7 +79,8 @@ type Dialer struct {
 	TLS *tls.Config
 
 	// SASLMechanism configures the Dialer to use SASL authentication.  If nil,
-	// no authentication will be performed.
+	// no authentication will be performed.  Connections re-authenticate before
+	// the session lifetime announced by the broker elapses (KIP-368).
 	SASLMechanism sasl.Mechanism
 
 	// The transactional id to use for transactional delivery. Idempotent
@@ -291,51 +290,14 @@ func (d *Dialer) connect(ctx context.Context, network, address string, connCfg C
 			Host: host,
 			Port: port,
 		}
-		if err := d.authenticateSASL(sasl.WithMetadata(ctx, metadata), conn); err != nil {
+		conn.sasl = &connSASL{mechanism: d.SASLMechanism, metadata: metadata}
+		if err := conn.authenticateSASL(sasl.WithMetadata(ctx, metadata), &conn.wdeadline, d.SASLMechanism); err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("could not successfully authenticate to %s:%d with SASL: %w", host, port, err)
 		}
 	}
 
 	return conn, nil
-}
-
-// authenticateSASL performs all of the required requests to authenticate this
-// connection.  If any step fails, this function returns with an error.  A nil
-// error indicates successful authentication.
-//
-// In case of error, this function *does not* close the connection.  That is the
-// responsibility of the caller.
-func (d *Dialer) authenticateSASL(ctx context.Context, conn *Conn) error {
-	if err := conn.saslHandshake(d.SASLMechanism.Name()); err != nil {
-		return fmt.Errorf("SASL handshake failed: %w", err)
-	}
-
-	sess, state, err := d.SASLMechanism.Start(ctx)
-	if err != nil {
-		return fmt.Errorf("SASL authentication process could not be started: %w", err)
-	}
-
-	for completed := false; !completed; {
-		challenge, err := conn.saslAuthenticate(state)
-		switch {
-		case err == nil:
-		case errors.Is(err, io.EOF):
-			// the broker may communicate a failed exchange by closing the
-			// connection (esp. in the case where we're passing opaque sasl
-			// data over the wire since there's no protocol info).
-			return SASLAuthenticationFailed
-		default:
-			return err
-		}
-
-		completed, state, err = sess.Next(ctx, challenge)
-		if err != nil {
-			return fmt.Errorf("SASL authentication process has failed: %w", err)
-		}
-	}
-
-	return nil
 }
 
 func (d *Dialer) dialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
