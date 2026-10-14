@@ -140,7 +140,7 @@ func (d *Dialer) DialLeader(ctx context.Context, network string, address string,
 // descriptor. It's strongly advised to use descriptor of the partition that comes out of
 // functions LookupPartition or LookupPartitions.
 func (d *Dialer) DialPartition(ctx context.Context, network string, address string, partition Partition) (*Conn, error) {
-	return d.connect(ctx, network, net.JoinHostPort(partition.Leader.Host, strconv.Itoa(partition.Leader.Port)), ConnConfig{
+	return d.connect(withDialStage(ctx, "leader"), network, net.JoinHostPort(partition.Leader.Host, strconv.Itoa(partition.Leader.Port)), ConnConfig{
 		ClientID:        d.ClientID,
 		Topic:           partition.Topic,
 		Partition:       partition.ID,
@@ -159,7 +159,7 @@ func (d *Dialer) LookupLeader(ctx context.Context, network string, address strin
 
 // LookupPartition searches for the description of specified partition id.
 func (d *Dialer) LookupPartition(ctx context.Context, network string, address string, topic string, partition int) (Partition, error) {
-	c, err := d.DialContext(ctx, network, address)
+	c, err := d.DialContext(withDialStage(ctx, "lookup"), network, address)
 	if err != nil {
 		return Partition{}, err
 	}

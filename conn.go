@@ -1402,6 +1402,7 @@ func (c *Conn) reauthenticateIfDue() error {
 	var d connDeadline
 	d.setDeadline(time.Now().Add(saslReauthTimeout))
 
+	ctx = ContextWithDialInfo(ctx, DialInfo{Purpose: "reauth", Stage: "conn", Topic: c.topic, Partition: int(c.partition)})
 	if err := c.authenticateSASL(sasl.WithMetadata(ctx, c.sasl.metadata), &d, c.sasl.mechanism); err != nil {
 		c.saslReauthAt.Store(0)
 		c.conn.Close()
@@ -1435,8 +1436,10 @@ func (c *Conn) authenticateSASL(ctx context.Context, d *connDeadline, mechanism 
 			// the broker may communicate a failed exchange by closing the
 			// connection (esp. in the case where we're passing opaque sasl
 			// data over the wire since there's no protocol info).
+			notifySASLFailed(ctx, mechanism, err)
 			return SASLAuthenticationFailed
 		default:
+			notifySASLFailed(ctx, mechanism, err)
 			return err
 		}
 

@@ -162,7 +162,7 @@ type ConsumerGroupConfig struct {
 
 	// connect is a function for dialing the coordinator.  This is provided for
 	// unit testing to mock broker connections.
-	connect func(dialer *Dialer, brokers ...string) (coordinator, error)
+	connect func(ctx context.Context, dialer *Dialer, brokers ...string) (coordinator, error)
 }
 
 // Validate method validates ConsumerGroupConfig properties and sets relevant
@@ -761,6 +761,9 @@ func (cg *ConsumerGroup) run() {
 			_ = cg.leaveGroup(memberID)
 			memberID = ""
 			backoff = time.After(cg.config.JoinGroupBackoff)
+			cg.withLogger(func(log Logger) {
+				log.Printf("probe: consumer group %s backs off %s before rejoining: %v", cg.config.ID, cg.config.JoinGroupBackoff, err)
+			})
 		}
 		// ensure that we exit cleanly in case the CG is done and no one is
 		// waiting to receive on the unbuffered error channel.
@@ -883,12 +886,12 @@ func (cg *ConsumerGroup) nextGeneration(memberID string) (string, error) {
 }
 
 // connect returns a connection to ANY broker.
-func makeConnect(config ConsumerGroupConfig) func(dialer *Dialer, brokers ...string) (coordinator, error) {
-	return func(dialer *Dialer, brokers ...string) (coordinator, error) {
+func makeConnect(config ConsumerGroupConfig) func(ctx context.Context, dialer *Dialer, brokers ...string) (coordinator, error) {
+	return func(ctx context.Context, dialer *Dialer, brokers ...string) (coordinator, error) {
 		var err error
 		for _, broker := range brokers {
 			var conn *Conn
-			if conn, err = dialer.Dial("tcp", broker); err == nil {
+			if conn, err = dialer.DialContext(ctx, "tcp", broker); err == nil {
 				return &timeoutCoordinator{
 					conn:             conn,
 					timeout:          config.Timeout,
@@ -908,7 +911,8 @@ func (cg *ConsumerGroup) coordinator() (coordinator, error) {
 	//        here.  since consumer group balances happen infrequently and are
 	//        an expensive operation, we're not currently optimizing that case
 	//        in order to keep the code simpler.
-	conn, err := cg.config.connect(cg.config.Dialer, cg.config.Brokers...)
+	ctx := ContextWithDialInfo(context.Background(), DialInfo{Purpose: "group_coordinator", GroupID: cg.config.ID})
+	conn, err := cg.config.connect(withDialStage(ctx, "find"), cg.config.Dialer, cg.config.Brokers...)
 	if err != nil {
 		return nil, err
 	}
@@ -925,7 +929,7 @@ func (cg *ConsumerGroup) coordinator() (coordinator, error) {
 	}
 
 	address := net.JoinHostPort(out.Coordinator.Host, strconv.Itoa(int(out.Coordinator.Port)))
-	return cg.config.connect(cg.config.Dialer, address)
+	return cg.config.connect(withDialStage(ctx, "connect"), cg.config.Dialer, address)
 }
 
 // joinGroup attempts to join the reader to the consumer group.
