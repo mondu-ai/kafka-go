@@ -1190,6 +1190,10 @@ func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 	r.cancel = cancel
 	r.version++
 
+	r.withLogger(func(log Logger) {
+		log.Printf("probe: group %s restarts %d partition readers, reader version %d", r.config.GroupID, len(offsetsByPartition), r.version)
+	})
+
 	r.join.Add(len(offsetsByPartition))
 	for key, offset := range offsetsByPartition {
 		go func(ctx context.Context, key topicPartition, offset int64, join *sync.WaitGroup) {
@@ -1197,6 +1201,7 @@ func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 
 			(&reader{
 				dialer:           r.config.Dialer,
+				groupID:          r.config.GroupID,
 				logger:           r.config.Logger,
 				errorLogger:      r.config.ErrorLogger,
 				brokers:          r.config.Brokers,
@@ -1226,6 +1231,7 @@ func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 // them using the high level reader API.
 type reader struct {
 	dialer           *Dialer
+	groupID          string
 	logger           Logger
 	errorLogger      Logger
 	brokers          []string
@@ -1265,7 +1271,11 @@ func (r *reader) run(ctx context.Context, offset int64) {
 	// on a Read call after reading the first error.
 	for attempt := 0; true; attempt++ {
 		if attempt != 0 {
-			if !sleep(ctx, backoff(attempt, r.backoffDelayMin, r.backoffDelayMax)) {
+			d := backoff(attempt, r.backoffDelayMin, r.backoffDelayMax)
+			r.withLogger(func(log Logger) {
+				log.Printf("probe: partition %d of %s backs off %s before initialize attempt %d, reader version %d", r.partition, r.topic, d, attempt, r.version)
+			})
+			if !sleep(ctx, d) {
 				return
 			}
 		}
@@ -1274,7 +1284,15 @@ func (r *reader) run(ctx context.Context, offset int64) {
 			log.Printf("initializing kafka reader for partition %d of %s starting at offset %d", r.partition, r.topic, toHumanOffset(offset))
 		})
 
-		conn, start, err := r.initialize(ctx, offset)
+		ictx := ContextWithDialInfo(ctx, DialInfo{
+			Purpose:       "partition_reader",
+			GroupID:       r.groupID,
+			Topic:         r.topic,
+			Partition:     r.partition,
+			Attempt:       attempt,
+			ReaderVersion: r.version,
+		})
+		conn, start, err := r.initialize(ictx, offset)
 		if err != nil {
 			if errors.Is(err, OffsetOutOfRange) {
 				if r.offsetOutOfRangeError {
@@ -1310,6 +1328,11 @@ func (r *reader) run(ctx context.Context, offset int64) {
 		// Resetting the attempt counter ensures that if a failure occurs after
 		// a successful initialization we don't keep increasing the backoff
 		// timeout.
+		if attempt != 0 {
+			r.withLogger(func(log Logger) {
+				log.Printf("probe: partition %d of %s resets initialize backoff after %d failed attempts", r.partition, r.topic, attempt)
+			})
+		}
 		attempt = 0
 
 		// Now we're sure to have an absolute offset number, may anything happen
@@ -1319,6 +1342,11 @@ func (r *reader) run(ctx context.Context, offset int64) {
 		errcount := 0
 	readLoop:
 		for {
+			if errcount != 0 {
+				r.withLogger(func(log Logger) {
+					log.Printf("probe: partition %d of %s backs off %s after %d consecutive read errors", r.partition, r.topic, backoff(errcount, r.backoffDelayMin, r.backoffDelayMax), errcount)
+				})
+			}
 			if !sleep(ctx, backoff(errcount, r.backoffDelayMin, r.backoffDelayMax)) {
 				conn.Close()
 				return

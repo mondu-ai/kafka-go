@@ -580,7 +580,7 @@ func TestConsumerGroupErrors(t *testing.T) {
 				RebalanceTimeout:  time.Second,
 				JoinGroupBackoff:  time.Second,
 				RetentionTime:     time.Hour,
-				connect: func(*Dialer, ...string) (coordinator, error) {
+				connect: func(context.Context, *Dialer, ...string) (coordinator, error) {
 					return mc, nil
 				},
 				Logger: &testKafkaLogger{T: t},
@@ -722,7 +722,7 @@ func TestConsumerGroupJoinGroupHandshake(t *testing.T) {
 				// gotMemberIDs before the assertions complete.
 				JoinGroupBackoff: 30 * time.Second,
 				RetentionTime:    time.Hour,
-				connect: func(*Dialer, ...string) (coordinator, error) {
+				connect: func(context.Context, *Dialer, ...string) (coordinator, error) {
 					return mc, nil
 				},
 				Logger: &testKafkaLogger{T: t},

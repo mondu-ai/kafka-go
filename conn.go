@@ -1402,6 +1402,7 @@ func (c *Conn) reauthenticateIfDue() error {
 	var d connDeadline
 	d.setDeadline(time.Now().Add(saslReauthTimeout))
 
+	ctx = ContextWithDialInfo(ctx, DialInfo{Purpose: "reauth", Stage: "conn", Topic: c.topic, Partition: int(c.partition)})
 	if err := c.authenticateSASL(sasl.WithMetadata(ctx, c.sasl.metadata), &d, c.sasl.mechanism); err != nil {
 		c.saslReauthAt.Store(0)
 		c.conn.Close()

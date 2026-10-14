@@ -1141,6 +1141,7 @@ func (g *connGroup) releaseConn(c *conn) bool {
 
 func (g *connGroup) connect(ctx context.Context, addr net.Addr) (*conn, error) {
 	deadline := time.Now().Add(g.pool.dialTimeout)
+	ctx = withDialPurposeDefault(ctx, "transport")
 
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -1309,6 +1310,7 @@ func (c *conn) reauthenticate(pc *protocol.Conn) error {
 	pc.SetDeadline(time.Now().Add(c.group.pool.dialTimeout))
 	defer pc.SetDeadline(time.Time{})
 
+	ctx = ContextWithDialInfo(ctx, DialInfo{Purpose: "reauth", Stage: "transport"})
 	lifetime, err := authenticateSASL(sasl.WithMetadata(ctx, c.saslMetadata), pc, c.group.pool.sasl)
 	if err != nil {
 		return err
