@@ -1341,6 +1341,7 @@ func authenticateSASL(ctx context.Context, pc *protocol.Conn, mechanism sasl.Mec
 		var challenge []byte
 		challenge, lifetime, err = saslAuthenticateRoundTrip(pc, state)
 		if err != nil {
+			notifySASLFailed(ctx, mechanism, err)
 			if errors.Is(err, io.EOF) {
 				// the broker may communicate a failed exchange by closing the
 				// connection (esp. in the case where we're passing opaque sasl

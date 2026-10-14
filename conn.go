@@ -1436,8 +1436,10 @@ func (c *Conn) authenticateSASL(ctx context.Context, d *connDeadline, mechanism 
 			// the broker may communicate a failed exchange by closing the
 			// connection (esp. in the case where we're passing opaque sasl
 			// data over the wire since there's no protocol info).
+			notifySASLFailed(ctx, mechanism, err)
 			return SASLAuthenticationFailed
 		default:
+			notifySASLFailed(ctx, mechanism, err)
 			return err
 		}
 

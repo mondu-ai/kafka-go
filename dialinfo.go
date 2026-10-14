@@ -44,3 +44,15 @@ func withDialPurposeDefault(ctx context.Context, purpose string) context.Context
 	info.Purpose = purpose
 	return ContextWithDialInfo(ctx, info)
 }
+
+// SASLFailureObserver is implemented by a sasl.Mechanism that wants to hear about an exchange it started and the
+// broker rejected or broke off. Next never sees those, because the broker's error code ends the exchange first.
+type SASLFailureObserver interface {
+	SASLFailed(ctx context.Context, err error)
+}
+
+func notifySASLFailed(ctx context.Context, mechanism any, err error) {
+	if o, ok := mechanism.(SASLFailureObserver); ok {
+		o.SASLFailed(ctx, err)
+	}
+}
